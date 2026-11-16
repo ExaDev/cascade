@@ -26,6 +26,10 @@ cascade-p2p = { path = "../p2p" }
 cascade-announce-wire = { version = "0.1.56", path = "../cascade-announce-wire" }
 serde_json = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["socket", "time"] }
+listenfd = "1.0.2"
+
 [features]
 default = ["metrics"]
 metrics = ["dep:axum"]

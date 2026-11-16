@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// Shared counter handle.
 #[derive(Debug, Default)]
@@ -22,6 +22,15 @@ pub struct Counters {
     pub auth_failures_total: AtomicU64,
     /// Cumulative bytes ferried across all paired sessions.
     pub bytes_relayed_total: AtomicU64,
+    /// Client connection tasks currently open, in any state (handshaking,
+    /// parked or paired). A paired session holds one: the second peer's stream
+    /// is handed to the first peer's task. A draining relay exits once this
+    /// reaches zero.
+    pub connections_open: AtomicI64,
+    /// Set once the relay has stopped accepting connections and is waiting
+    /// for the open ones to finish. `/health` reports it as unhealthy so a
+    /// health gate never counts a draining instance as ready.
+    pub draining: AtomicBool,
 }
 
 impl Counters {
@@ -101,6 +110,28 @@ impl Counters {
             self.bytes_relayed_total.load(Ordering::Relaxed)
         );
 
+        let _ = writeln!(
+            out,
+            "# HELP cascade_relay_connections_open Client connection tasks currently open."
+        );
+        let _ = writeln!(out, "# TYPE cascade_relay_connections_open gauge");
+        let _ = writeln!(
+            out,
+            "cascade_relay_connections_open {}",
+            self.connections_open.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP cascade_relay_draining 1 once the relay has stopped accepting connections."
+        );
+        let _ = writeln!(out, "# TYPE cascade_relay_draining gauge");
+        let _ = writeln!(
+            out,
+            "cascade_relay_draining {}",
+            u8::from(self.draining.load(Ordering::Relaxed))
+        );
+
         out
     }
 }
@@ -117,6 +148,8 @@ mod axum_endpoint {
     use axum::http::header::CONTENT_TYPE;
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
+    use std::sync::atomic::Ordering;
+
     use tokio::net::TcpListener;
 
     use super::Counters;
@@ -160,15 +193,18 @@ mod axum_endpoint {
         ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
     }
 
-    /// Unauthenticated liveness probe. Returns `200 OK` with the body `ok`.
-    ///
-    /// The handler takes no state and performs no computation — it exists solely
-    /// to let container healthchecks and load-balancer probes confirm the process
-    /// is alive and the HTTP listener is reachable. Always succeeds; a failure to
-    /// reach this endpoint means the process is down, not that anything went wrong
-    /// inside the handler.
-    pub(super) async fn health_handler() -> Response {
-        (StatusCode::OK, "ok").into_response()
+    /// Unauthenticated readiness probe. Returns `200 OK` with the body `ok`
+    /// while the relay accepts connections, and `503` with the body
+    /// `draining` once it has stopped accepting them and is waiting for open
+    /// connections to finish, so an update's health gate never mistakes an
+    /// outgoing instance for a ready one. A failure to reach the endpoint
+    /// means the process is down.
+    pub(super) async fn health_handler(State(counters): State<Arc<Counters>>) -> Response {
+        if counters.draining.load(Ordering::Relaxed) {
+            (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response()
+        } else {
+            (StatusCode::OK, "ok").into_response()
+        }
     }
 }
 
@@ -199,19 +235,37 @@ mod tests {
         }
     }
 
-    /// The `/health` handler returns `200 OK` with the body `ok`. The handler
-    /// is callable directly (no state, no axum extractors beyond the implicit
-    /// route match) so the test drives it without a network round-trip.
+    /// The `/health` handler returns `200 OK` with the body `ok` while the
+    /// relay accepts connections. It is called directly so the test needs no
+    /// network round-trip.
     #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn health_handler_returns_200_ok() {
         use axum::body::to_bytes;
         use axum::http::StatusCode;
 
-        let response = axum_endpoint::health_handler().await;
+        let counters = Counters::new();
+        let response = axum_endpoint::health_handler(axum::extract::State(counters)).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = to_bytes(response.into_body(), 16).await.unwrap();
         assert_eq!(body.as_ref(), b"ok");
+    }
+
+    /// Once draining starts, `/health` turns to `503` so a health gate never
+    /// treats the outgoing instance as ready.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn health_handler_reports_draining_as_unavailable() {
+        use axum::body::to_bytes;
+        use axum::http::StatusCode;
+
+        let counters = Counters::new();
+        counters.draining.store(true, Ordering::Relaxed);
+        let response = axum_endpoint::health_handler(axum::extract::State(counters)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), 16).await.unwrap();
+        assert_eq!(body.as_ref(), b"draining");
     }
 }

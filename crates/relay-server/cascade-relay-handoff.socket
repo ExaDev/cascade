@@ -1,0 +1,26 @@
+# Listening socket shared by the relay instances of the side-by-side update
+# path (docs/relay-deployment.md, "Updating without dropping connections").
+#
+# systemd owns this socket, so it stays open and queues connections for as
+# long as at least one cascade-relay-handoff@<slot>.service instance, or none,
+# is running. Every instance started with Sockets= on this unit inherits the
+# same listening file descriptor and accepts from it.
+
+[Unit]
+
+Description=Cascade relay listening socket (shared by update slots)
+Documentation=https://github.com/Mearman/cascade/blob/main/docs/relay-deployment.md
+
+
+[Socket]
+
+ListenStream=9999
+# Accept=no: instances call accept() themselves on the one inherited socket.
+Accept=no
+# Triggered unit: the always-running holder, never a slot (see the holder unit).
+Service=cascade-relay-handoff.service
+
+
+[Install]
+
+WantedBy=sockets.target
