@@ -37,6 +37,9 @@ services:
     image: ghcr.io/mearman/cascade-relay:latest
     container_name: cascade-relay
     restart: unless-stopped
+    # The relay drains open sessions on SIGTERM for up to its drain timeout
+    # (300 seconds by default) before exiting.
+    stop_grace_period: 330s
 
     environment:
       # 64-char hex HMAC secret.  Must match CASCADE_P2P_RELAY_SECRET below.

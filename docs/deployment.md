@@ -100,7 +100,7 @@ docker run -d \
 
 ### Health check
 
-When `CASCADE_RELAY_METRICS` is set, `GET /health` returns `200 OK` with body `ok`. Use this for container orchestrator probes and load-balancer health checks. It is unauthenticated and carries no sensitive information.
+When `CASCADE_RELAY_METRICS` is set, `GET /health` returns `200 OK` with body `ok` while the relay accepts connections, and `503` with body `draining` after it has been told to stop and is finishing its open sessions. Use this for container orchestrator probes and load-balancer health checks. To update the relay without dropping connections, see [Updating without dropping connections](relay-deployment.md#updating-without-dropping-connections). It is unauthenticated and carries no sensitive information.
 
 ```sh
 curl http://relay.example.com:9998/health

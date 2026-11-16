@@ -16,7 +16,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use cascade_relay_server::{RelayConfig, run_relay};
+use cascade_relay_server::RelayConfig;
+use cascade_relay_server::server::{RelayHandle, spawn};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -63,6 +64,12 @@ struct Cli {
     /// the endpoint stays disabled.
     #[arg(long)]
     announce_bind: Option<SocketAddr>,
+
+    /// How long a relay told to stop (SIGTERM or Ctrl-C) keeps serving its
+    /// open connections before exiting, in seconds. It stops accepting new
+    /// connections at once; `/health` reports `503` while it drains.
+    #[arg(long, default_value_t = 300)]
+    drain_timeout_seconds: u32,
 }
 
 #[tokio::main]
@@ -90,5 +97,55 @@ async fn main() -> Result<()> {
         announce_bind: cli.announce_bind,
     };
 
-    run_relay(config).await
+    let handle = start(config).await?;
+    wait_for_stop_signal().await?;
+    tracing::info!("stop signal received; draining open connections");
+    let remaining = handle
+        .drain(Duration::from_secs(u64::from(cli.drain_timeout_seconds)))
+        .await?;
+    if remaining > 0 {
+        tracing::warn!(
+            remaining,
+            "drain timeout reached with connections still open"
+        );
+    } else {
+        tracing::info!("drained cleanly");
+    }
+    Ok(())
+}
+
+/// Start the relay on a socket inherited from systemd when one is passed
+/// (`LISTEN_FDS`), otherwise on `--bind`. An inherited socket lets a second
+/// instance accept on the same listener during an update, so no connection
+/// is refused while one instance stops and the other starts.
+async fn start(config: RelayConfig) -> Result<RelayHandle> {
+    #[cfg(unix)]
+    {
+        let mut inherited = listenfd::ListenFd::from_env();
+        if let Some(std_listener) = inherited
+            .take_tcp_listener(0)
+            .context("reading the inherited listening socket")?
+        {
+            tracing::info!("serving on the listening socket inherited from systemd");
+            return cascade_relay_server::server::spawn_with_listener(config, std_listener).await;
+        }
+    }
+    spawn(config).await
+}
+
+/// Resolve on SIGTERM (unix) or Ctrl-C.
+async fn wait_for_stop_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+        tokio::select! {
+            _ = term.recv() => Ok(()),
+            result = tokio::signal::ctrl_c() => result.context("waiting for Ctrl-C"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")
+    }
 }

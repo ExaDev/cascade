@@ -1,0 +1,29 @@
+# Holder for cascade-relay-handoff.socket.
+#
+# A socket unit follows the state of the one service it triggers. If that were
+# a slot, stopping the old slot at the end of an update would put the socket
+# back in its listening state, and systemd would start that slot again when
+# the next connection arrived, running a third instance. This unit does
+# nothing and stays active, so the socket stays in its running state and
+# systemd never activates anything on traffic. The slots, not this unit, do
+# the accepting.
+
+[Unit]
+
+Description=Cascade relay socket holder
+Requires=cascade-relay-handoff.socket
+After=cascade-relay-handoff.socket
+
+
+[Service]
+
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/bin/true
+Sockets=cascade-relay-handoff.socket
+
+
+[Install]
+
+WantedBy=multi-user.target

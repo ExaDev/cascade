@@ -42,9 +42,9 @@ pub struct RelayHandle {
     pub announce_addr: Option<SocketAddr>,
     /// Shared counters — useful for tests asserting against metric values.
     pub counters: Arc<Counters>,
-    /// Channel that, when signalled (sender dropped), instructs the server
-    /// loop to terminate at the next accept boundary.
-    _shutdown: mpsc::Sender<()>,
+    /// Channel that, when signalled or dropped, instructs the server loop to
+    /// stop accepting at the next accept boundary.
+    shutdown: mpsc::Sender<()>,
     listener_task: tokio::task::JoinHandle<()>,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
     announce_task: Option<tokio::task::JoinHandle<()>>,
@@ -68,16 +68,64 @@ impl RelayHandle {
         }
         Ok(())
     }
+
+    /// Stop accepting connections and wait for the open ones to finish.
+    ///
+    /// Marks the relay as draining (`/health` turns to `503`), closes the
+    /// listener, releases parked peers so they reconnect elsewhere, then waits
+    /// until no client connection remains or `timeout` elapses. Returns the
+    /// number of connections still open, which is zero for a clean drain.
+    /// Dropping the listener only closes this process's copy of the socket, so
+    /// with an inherited listener the other instance keeps accepting and no
+    /// queued connection is lost.
+    pub async fn drain(self, timeout: Duration) -> Result<i64> {
+        self.counters.draining.store(true, Ordering::Relaxed);
+        // A closed channel means the listener task already stopped.
+        let _ = self.shutdown.send(()).await;
+        self.listener_task
+            .await
+            .context("relay listener task panicked")?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let open = self.counters.connections_open.load(Ordering::Relaxed);
+            if open <= 0 || tokio::time::Instant::now() >= deadline {
+                return Ok(open.max(0));
+            }
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    }
 }
+
+/// How often a draining relay re-reads its open connection count.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Run the relay until the returned handle is dropped or `join`'d.
 pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding relay listener to {}", config.bind))?;
-    let local_addr = listener
-        .local_addr()
-        .context("reading local address for bound relay listener")?;
+    spawn_serving(config, Incoming::Owned(listener)).await
+}
+
+/// Like [`spawn`], serving on an already-bound `listener`.
+///
+/// `config.bind` is ignored. Used to serve on a socket inherited from systemd,
+/// so two relay instances can accept on one socket during an update.
+///
+/// The listener's open file description is shared with every other instance,
+/// and systemd puts it in blocking mode each time it starts one, so its
+/// `O_NONBLOCK` flag cannot be relied on. Accepting therefore runs on a
+/// dedicated thread that tolerates either mode (see [`Incoming`]).
+pub async fn spawn_with_listener(
+    config: RelayConfig,
+    listener: std::net::TcpListener,
+) -> Result<RelayHandle> {
+    let incoming = Incoming::from_shared(listener)?;
+    spawn_serving(config, incoming).await
+}
+
+async fn spawn_serving(config: RelayConfig, incoming: Incoming) -> Result<RelayHandle> {
+    let local_addr = incoming.local_addr()?;
 
     let registry = SessionRegistry::new();
     let counters = Counters::new();
@@ -92,7 +140,7 @@ pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
 
     let listener_task = tokio::spawn(async move {
         run_listener(
-            listener,
+            incoming,
             listener_config,
             listener_registry,
             listener_counters,
@@ -108,7 +156,7 @@ pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
         metrics_addr,
         announce_addr,
         counters,
-        _shutdown: shutdown_tx,
+        shutdown: shutdown_tx,
         listener_task,
         metrics_task,
         announce_task,
@@ -179,7 +227,7 @@ async fn spawn_announce_endpoint(
 }
 
 async fn run_listener(
-    listener: TcpListener,
+    mut incoming: Incoming,
     config: RelayConfig,
     registry: SessionRegistry,
     counters: Arc<Counters>,
@@ -206,16 +254,10 @@ async fn run_listener(
                 info!("relay shutdown signal received");
                 break;
             }
-            accept = listener.accept() => {
+            accept = incoming.accept() => {
                 match accept {
                     Ok((stream, peer)) => {
-                        let registry = registry.clone();
-                        let counters = counters.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_connection(stream, peer, &config, &registry, &counters).await {
-                                warn!(error = %err, %peer, "relay connection ended with error");
-                            }
-                        });
+                        serve_stream(stream, peer, config, &registry, &counters);
                     }
                     Err(err) => {
                         warn!(error = %err, "accept failed");
@@ -225,8 +267,184 @@ async fn run_listener(
         }
     }
 
+    // Connections the acceptor took before it stopped are served, not reset.
+    for (stream, peer) in incoming.stop().await {
+        serve_stream(stream, peer, config, &registry, &counters);
+    }
+
     registry.shutdown().await;
     reaper.abort();
+}
+
+fn serve_stream(
+    stream: TcpStream,
+    peer: SocketAddr,
+    config: RelayConfig,
+    registry: &SessionRegistry,
+    counters: &Arc<Counters>,
+) {
+    let registry = registry.clone();
+    let counters = counters.clone();
+    counters.connections_open.fetch_add(1, Ordering::Relaxed);
+    tokio::spawn(async move {
+        let _open = OpenConnection(counters.clone());
+        if let Err(err) = handle_connection(stream, peer, &config, &registry, &counters).await {
+            warn!(error = %err, %peer, "relay connection ended with error");
+        }
+    });
+}
+
+/// Where accepted connections come from.
+enum Incoming {
+    /// A listener this process bound itself, accepted on the runtime.
+    Owned(TcpListener),
+    /// A listener shared with other processes, accepted on a dedicated thread.
+    Shared(SharedAcceptor),
+}
+
+/// How long the acceptor thread blocks in `accept` before it re-checks
+/// whether it was told to stop. Bounds how long a draining instance keeps
+/// taking connections after the stop request.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+struct SharedAcceptor {
+    local_addr: SocketAddr,
+    streams: mpsc::UnboundedReceiver<std::io::Result<(std::net::TcpStream, SocketAddr)>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Incoming {
+    /// Take a listener shared with other instances.
+    ///
+    /// The socket is put in blocking mode with a receive timeout, which also
+    /// bounds `accept` on Linux, so `accept` returns control every
+    /// [`ACCEPT_POLL_INTERVAL`] whoever else touches the shared flags. A
+    /// blocking `accept` that loses a race for a connection to the other
+    /// instance simply waits out the timeout.
+    #[cfg(unix)]
+    fn from_shared(listener: std::net::TcpListener) -> Result<Self> {
+        use nix::sys::socket::{setsockopt, sockopt::ReceiveTimeout};
+        use nix::sys::time::TimeVal;
+        use std::sync::atomic::AtomicBool;
+
+        let local_addr = listener
+            .local_addr()
+            .context("reading local address for the shared relay listener")?;
+        listener
+            .set_nonblocking(false)
+            .context("putting the shared listener in blocking mode")?;
+        let timeout = TimeVal::new(
+            i64::try_from(ACCEPT_POLL_INTERVAL.as_secs()).context("accept interval seconds")?,
+            i64::from(ACCEPT_POLL_INTERVAL.subsec_micros()),
+        );
+        setsockopt(&listener, ReceiveTimeout, &timeout)
+            .context("setting the shared listener's accept timeout")?;
+
+        let (tx, streams) = mpsc::unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("relay-accept".to_owned())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok(accepted) => {
+                            if tx.send(Ok(accepted)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(err) => {
+                            if tx.send(Err(err)).is_err() {
+                                break;
+                            }
+                            std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                        }
+                    }
+                }
+            })
+            .context("starting the accept thread")?;
+        Ok(Self::Shared(SharedAcceptor {
+            local_addr,
+            streams,
+            stop,
+            thread: Some(thread),
+        }))
+    }
+
+    /// Shared listeners come from systemd socket passing, which is Unix only.
+    #[cfg(not(unix))]
+    fn from_shared(_listener: std::net::TcpListener) -> Result<Self> {
+        anyhow::bail!("an inherited listening socket is only supported on Unix")
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr> {
+        match self {
+            Self::Owned(listener) => listener
+                .local_addr()
+                .context("reading local address for bound relay listener"),
+            Self::Shared(shared) => Ok(shared.local_addr),
+        }
+    }
+
+    async fn accept(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        match self {
+            Self::Owned(listener) => listener.accept().await,
+            Self::Shared(shared) => match shared.streams.recv().await {
+                Some(Ok((stream, peer))) => {
+                    stream.set_nonblocking(true)?;
+                    Ok((TcpStream::from_std(stream)?, peer))
+                }
+                Some(Err(err)) => Err(err),
+                // The thread only ends after `stop`, so a closed channel
+                // while accepting is unreachable; wait forever rather than
+                // spin if it ever happens.
+                None => std::future::pending().await,
+            },
+        }
+    }
+
+    /// Stop accepting and return the connections accepted but not yet served.
+    ///
+    /// For a shared listener this waits for the acceptor thread to exit, so
+    /// this process's copy of the socket is closed before it returns and the
+    /// other instance owns every later connection.
+    async fn stop(self) -> Vec<(TcpStream, SocketAddr)> {
+        let Self::Shared(mut shared) = self else {
+            return Vec::new();
+        };
+        shared.stop.store(true, Ordering::Release);
+        if let Some(thread) = shared.thread.take() {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+        let mut pending = Vec::new();
+        while let Ok(Ok((stream, peer))) = shared.streams.try_recv() {
+            if stream.set_nonblocking(true).is_err() {
+                continue;
+            }
+            if let Ok(stream) = TcpStream::from_std(stream) {
+                pending.push((stream, peer));
+            }
+        }
+        pending
+    }
+}
+
+/// Decrements the open-connection gauge when a connection task ends, on every
+/// exit path including a panic.
+struct OpenConnection(Arc<Counters>);
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.0.connections_open.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[allow(clippy::result_large_err)]

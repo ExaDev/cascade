@@ -865,6 +865,39 @@ jobs:
           path: ${{ runner.temp }}/sccache
           key: sccache-nat-integration-${{ github.sha }}
 
+  relay-update:
+    name: Relay side-by-side update (systemd --user)
+    needs: [check]
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: relay-update
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the relay
+        run: cargo build --release -p cascade-relay-server
+      - name: Start a systemd user manager
+        # The test drives the shipped handoff units under `systemctl --user`.
+        run: |
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in $(seq 1 30); do
+            systemctl --user is-system-running --wait >/dev/null 2>&1 && break
+            sleep 1
+          done
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus" >> "$GITHUB_ENV"
+      - name: Run the update, rollback and kill tests
+        run: |
+          CASCADE_RELAY_TEST_BINARY="$PWD/target/release/cascade-relay" \
+            python3 test/relay-update/test_update.py
+
   dht-live:
     name: DHT live tests (local mainline testnet)
     needs: [check, test]

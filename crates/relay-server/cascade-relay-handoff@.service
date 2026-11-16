@@ -1,0 +1,63 @@
+# One side-by-side slot of the cascade relay. The instance name is the slot
+# (blue or green): cascade-relay-handoff@blue.service.
+#
+# Slots accept on the socket inherited from cascade-relay-handoff.socket, so
+# two slots can run at once. cascade-relay-update.sh starts the idle slot with
+# the new binary, health-gates it and then stops the other slot, which drains.
+#
+# Install:
+#
+#   install -d /usr/local/lib/cascade-relay/blue /usr/local/lib/cascade-relay/green
+#   install -m 0755 cascade-relay /usr/local/lib/cascade-relay/blue/cascade-relay
+#   install -m 0755 cascade-relay-start.sh /usr/local/bin/
+#   cp cascade-relay-handoff.socket cascade-relay-handoff.service \
+#      cascade-relay-handoff@.service /etc/systemd/system/
+#   # /etc/cascade/relay.env holds the shared secret; relay-blue.env and
+#   # relay-green.env each set a distinct CASCADE_RELAY_METRICS (see
+#   # relay-slot.env.example).
+#   systemctl daemon-reload
+#   systemctl enable --now cascade-relay-handoff.socket cascade-relay-handoff.service
+#   systemctl start cascade-relay-handoff@blue.service
+
+[Unit]
+
+Description=Cascade relay (slot %i)
+Documentation=https://github.com/Mearman/cascade/blob/main/docs/relay-deployment.md
+After=network-online.target cascade-relay-handoff.socket
+Wants=network-online.target
+Requires=cascade-relay-handoff.socket
+
+
+[Service]
+
+Type=simple
+Sockets=cascade-relay-handoff.socket
+EnvironmentFile=/etc/cascade/relay.env
+# A distinct metrics address per slot lets the update script probe each slot's
+# own /health while both run.
+EnvironmentFile=/etc/cascade/relay-%i.env
+Environment=CASCADE_RELAY_BIN=/usr/local/lib/cascade-relay/%i/cascade-relay
+
+ExecStart=/usr/local/bin/cascade-relay-start.sh
+
+# SIGTERM makes the relay stop accepting and drain. TimeoutStopSec must exceed
+# the relay's --drain-timeout-seconds (300 by default) so systemd does not
+# SIGKILL a draining slot.
+KillSignal=SIGTERM
+TimeoutStopSec=330s
+
+# Restart a crashed slot, but never one the update script stopped.
+Restart=on-failure
+RestartSec=5s
+
+User=cascade-relay
+Group=cascade-relay
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6

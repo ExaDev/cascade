@@ -17,6 +17,8 @@
 #                                  Default (from clap): 0.0.0.0:9999
 #   CASCADE_RELAY_METRICS        — bind address for /metrics and /health.
 #                                  When unset, neither endpoint is started.
+#   CASCADE_RELAY_BIN            — path of the cascade-relay binary to run.
+#                                  Default: /usr/local/bin/cascade-relay
 #   CASCADE_RELAY_ANNOUNCE       — bind address for the announce directory.
 #                                  Requires the announce build feature.
 #                                  When unset, the announce endpoint is disabled.
@@ -47,5 +49,7 @@ fi
 
 # CASCADE_RELAY_SHARED_SECRET remains in the environment; clap reads it via
 # env = "CASCADE_RELAY_SHARED_SECRET" without it appearing in the command line.
+# CASCADE_RELAY_BIN selects the binary; the handoff units set it per slot so
+# an update can run the new version beside the old one.
 # shellcheck disable=SC2086
-exec /usr/local/bin/cascade-relay $ARGS "$@"
+exec "${CASCADE_RELAY_BIN:-/usr/local/bin/cascade-relay}" $ARGS "$@"
