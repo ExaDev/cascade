@@ -115,7 +115,8 @@ pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
 /// The listener's open file description is shared with every other instance,
 /// and systemd puts it in blocking mode each time it starts one, so its
 /// `O_NONBLOCK` flag cannot be relied on. Accepting therefore runs on a
-/// dedicated thread that tolerates either mode (see [`Incoming`]).
+/// dedicated thread that tolerates either mode.
+#[cfg(unix)]
 pub async fn spawn_with_listener(
     config: RelayConfig,
     listener: std::net::TcpListener,
@@ -299,14 +300,17 @@ enum Incoming {
     /// A listener this process bound itself, accepted on the runtime.
     Owned(TcpListener),
     /// A listener shared with other processes, accepted on a dedicated thread.
+    #[cfg(unix)]
     Shared(SharedAcceptor),
 }
 
 /// How long the acceptor thread blocks in `accept` before it re-checks
 /// whether it was told to stop. Bounds how long a draining instance keeps
 /// taking connections after the stop request.
+#[cfg(unix)]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+#[cfg(unix)]
 struct SharedAcceptor {
     local_addr: SocketAddr,
     streams: mpsc::UnboundedReceiver<std::io::Result<(std::net::TcpStream, SocketAddr)>>,
@@ -325,7 +329,7 @@ impl Incoming {
     #[cfg(unix)]
     fn from_shared(listener: std::net::TcpListener) -> Result<Self> {
         use nix::sys::socket::{setsockopt, sockopt::ReceiveTimeout};
-        use nix::sys::time::TimeVal;
+        use nix::sys::time::{TimeVal, TimeValLike};
         use std::sync::atomic::AtomicBool;
 
         let local_addr = listener
@@ -334,9 +338,8 @@ impl Incoming {
         listener
             .set_nonblocking(false)
             .context("putting the shared listener in blocking mode")?;
-        let timeout = TimeVal::new(
-            i64::try_from(ACCEPT_POLL_INTERVAL.as_secs()).context("accept interval seconds")?,
-            i64::from(ACCEPT_POLL_INTERVAL.subsec_micros()),
+        let timeout = TimeVal::microseconds(
+            i64::try_from(ACCEPT_POLL_INTERVAL.as_micros()).context("accept interval")?,
         );
         setsockopt(&listener, ReceiveTimeout, &timeout)
             .context("setting the shared listener's accept timeout")?;
@@ -379,17 +382,12 @@ impl Incoming {
         }))
     }
 
-    /// Shared listeners come from systemd socket passing, which is Unix only.
-    #[cfg(not(unix))]
-    fn from_shared(_listener: std::net::TcpListener) -> Result<Self> {
-        anyhow::bail!("an inherited listening socket is only supported on Unix")
-    }
-
     fn local_addr(&self) -> Result<SocketAddr> {
         match self {
             Self::Owned(listener) => listener
                 .local_addr()
                 .context("reading local address for bound relay listener"),
+            #[cfg(unix)]
             Self::Shared(shared) => Ok(shared.local_addr),
         }
     }
@@ -397,6 +395,7 @@ impl Incoming {
     async fn accept(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
         match self {
             Self::Owned(listener) => listener.accept().await,
+            #[cfg(unix)]
             Self::Shared(shared) => match shared.streams.recv().await {
                 Some(Ok((stream, peer))) => {
                     stream.set_nonblocking(true)?;
@@ -417,6 +416,19 @@ impl Incoming {
     /// this process's copy of the socket is closed before it returns and the
     /// other instance owns every later connection.
     async fn stop(self) -> Vec<(TcpStream, SocketAddr)> {
+        #[cfg(not(unix))]
+        {
+            let Self::Owned(_) = self;
+            Vec::new()
+        }
+        #[cfg(unix)]
+        {
+            self.stop_shared().await
+        }
+    }
+
+    #[cfg(unix)]
+    async fn stop_shared(self) -> Vec<(TcpStream, SocketAddr)> {
         let Self::Shared(mut shared) = self else {
             return Vec::new();
         };
