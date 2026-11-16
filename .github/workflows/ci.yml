@@ -211,7 +211,7 @@ jobs:
           xcodebuild
           -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
           -scheme FileProviderLogicTests -sdk iphonesimulator
-          -destination 'platform=iOS Simulator,name=iPhone 16,arch=arm64'
+          -destination 'platform=iOS Simulator,name=iPhone 17,arch=arm64'
           -configuration Debug test
       - name: Run the integration tests (Simulator)
         # Drives the REAL CascadeNode through the FFI on the simulator — the
@@ -220,7 +220,7 @@ jobs:
           xcodebuild
           -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
           -scheme CascadeIntegrationTests -sdk iphonesimulator
-          -destination 'platform=iOS Simulator,name=iPhone 16,arch=arm64'
+          -destination 'platform=iOS Simulator,name=iPhone 17,arch=arm64'
           -configuration Debug test
       - name: Run the File Provider OS-registration e2e (Simulator)
         # Registers a domain via NSFileProviderManager and enumerates through
@@ -232,7 +232,7 @@ jobs:
           xcodebuild
           -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
           -scheme FileProviderRegistrationE2ETests -sdk iphonesimulator
-          -destination 'platform=iOS Simulator,name=iPhone 16,arch=arm64'
+          -destination 'platform=iOS Simulator,name=iPhone 17,arch=arm64'
           -configuration Debug test
       - name: Package the Simulator app
         # The ad-hoc signed Simulator .app — drag into a booted simulator to run.
