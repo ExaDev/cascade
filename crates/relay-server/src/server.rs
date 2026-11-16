@@ -415,6 +415,9 @@ impl Incoming {
     /// For a shared listener this waits for the acceptor thread to exit, so
     /// this process's copy of the socket is closed before it returns and the
     /// other instance owns every later connection.
+    // Non-Unix builds have no shared acceptor to await; the signature stays
+    // identical so the call site does not differ per platform.
+    #[cfg_attr(not(unix), allow(clippy::unused_async))]
     async fn stop(self) -> Vec<(TcpStream, SocketAddr)> {
         #[cfg(not(unix))]
         {
